@@ -951,7 +951,7 @@ def start_ssh_tunnel(username, remote_address, ssh_port, ssh_password, local_rem
             logfile=fd, timeout=20, encoding='utf-8')
 
         # Match only "(yes/no" in order to handle both (yes/no) and (yes/no/[fingerprint])
-        i = child.expect([r'(?i)password:', r'\(yes\/no', r'.*[$#] ', pexpect.EOF])
+        i = child.expect([r'(?i)password:', r'\(yes\/no', r'.*[$#] ', r'Permission denied \(publickey,password\)', pexpect.EOF])
         if i == 0:
             child.sendline(ssh_password)
             try:
@@ -988,6 +988,8 @@ def start_ssh_tunnel(username, remote_address, ssh_port, ssh_password, local_rem
                     raise ValueError('Incorrect password')
                 except pexpect.TIMEOUT:
                     pass
+        elif i == 3:
+            raise Exception("SSH tunneling failed: please enable password authentication in your SSH client config.")
     except Exception as ex:
         if debug:
             print("ERROR: running local SSH client [{}] failed connecting to {}: {}".format(command, args, ex))
