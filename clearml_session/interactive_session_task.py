@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -1028,8 +1029,9 @@ def setup_user_env(param, task):
 
     elif os.environ.get("CLEARML_AUTH_TOKEN"):
         env['CLEARML_AUTH_TOKEN'] = os.environ.get("CLEARML_AUTH_TOKEN")
-        os.system("echo 'export CLEARML_AUTH_TOKEN=\"{}\"' >> {}".format(
-            os.environ.get("CLEARML_AUTH_TOKEN").replace('$', '\\$'), source_conf))
+        with open(os.path.expanduser(source_conf), 'a') as f:
+            f.write('export CLEARML_AUTH_TOKEN={}\n'.format(
+                shlex.quote(os.environ.get("CLEARML_AUTH_TOKEN"))))
 
     if param.get("default_docker"):
         os.system("echo 'export CLEARML_DOCKER_IMAGE=\"{}\"' >> {}".format(
