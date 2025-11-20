@@ -9,15 +9,19 @@ from copy import deepcopy
 import getpass
 from functools import partial
 from tempfile import mkstemp, gettempdir, mkdtemp
+from threading import Thread
 from time import sleep, time
-from datetime import datetime
+import datetime
+from uuid import uuid4
+import tarfile
+import platform
 
 import psutil
 import requests
 from clearml import Task, StorageManager
 from clearml.backend_api import Session
 from clearml.backend_api.services import tasks
-from pathlib2 import Path
+from pathlib import Path
 
 # noinspection SpellCheckingInspection
 default_ssh_fingerprint = {
@@ -94,6 +98,15 @@ def get_free_port(range_min, range_max):
     return port
 
 
+def _get_env_vars(*var_names, default=None):
+    for var_name in var_names:
+        value = os.environ.get(var_name, "").strip()
+        if value:
+            print(f"Using value from {var_name}: {value}")
+            return value
+    return default
+
+
 def init_task(param, a_default_ssh_fingerprint):
     # initialize ClearML
     Task.add_requirements('jupyter')
@@ -127,31 +140,55 @@ def init_task(param, a_default_ssh_fingerprint):
 
     # connect ssh fingerprint configuration (with fallback if section is missing)
     old_default_ssh_fingerprint = deepcopy(a_default_ssh_fingerprint)
-    try:
-        task.connect_configuration(configuration=a_default_ssh_fingerprint, name=config_object_section_ssh)
-    except (TypeError, ValueError):
-        a_default_ssh_fingerprint.clear()
-        a_default_ssh_fingerprint.update(old_default_ssh_fingerprint)
-    if param.get('default_docker'):
+    found_server_ssh_fingerprint = None
+    if Session.check_min_api_version('2.20'):
+        print("INFO: checking remote ssh server fingerprint from server vault")
+        # noinspection PyBroadException
+        try:
+            res = task.session.send_request(
+                "users", "get_vaults",
+                params="enabled=true&types=remote_session_ssh_server&"
+                       "types=remote_session_ssh_server").json()
+            if res.get('data', {}).get('vaults'):
+                found_server_ssh_fingerprint = json.loads(res['data']['vaults'][-1]['data'])
+                a_default_ssh_fingerprint.update(found_server_ssh_fingerprint)
+                print("INFO: loading fingerprint from server vault successfully: {}".format(
+                    list(found_server_ssh_fingerprint.keys())))
+            else:
+                print("INFO: server side fingerprint was not found")
+        except Exception as ex:
+            print("DEBUG: server side fingerprint parsing error: {}".format(ex))
+
+    if not found_server_ssh_fingerprint:
+        try:
+            # print("DEBUG: loading fingerprint from task")
+            task.connect_configuration(configuration=a_default_ssh_fingerprint, name=config_object_section_ssh)
+        except (TypeError, ValueError):
+            a_default_ssh_fingerprint.clear()
+            a_default_ssh_fingerprint.update(old_default_ssh_fingerprint)
+
+    if param.get('default_docker') and task.running_locally():
         task.set_base_docker("{} --network host".format(param['default_docker']))
+
     # leave local process, only run remotely
     task.execute_remotely()
     return task
 
 
-def setup_os_env(param):
+def setup_os_env(param, preserve_env_suffix=None):
     # get rid of all the runtime ClearML
-    preserve = (
-        "_API_HOST",
-        "_WEB_HOST",
-        "_FILES_HOST",
-        "_CONFIG_FILE",
-        "_API_ACCESS_KEY",
-        "_API_SECRET_KEY",
-        "_API_HOST_VERIFY_CERT",
-        "_DOCKER_IMAGE",
-        "_DOCKER_BASH_SCRIPT",
-    )
+    if preserve_env_suffix is None:
+        preserve_env_suffix = (
+            "_API_HOST",
+            "_WEB_HOST",
+            "_FILES_HOST",
+            "_CONFIG_FILE",
+            "_API_ACCESS_KEY",
+            "_API_SECRET_KEY",
+            "_API_HOST_VERIFY_CERT",
+            "_DOCKER_IMAGE",
+            "_DOCKER_BASH_SCRIPT",
+        )
     # set default docker image, with network configuration
     if param.get('default_docker', '').strip():
         os.environ["CLEARML_DOCKER_IMAGE"] = param['default_docker'].strip()
@@ -160,22 +197,30 @@ def setup_os_env(param):
     env = deepcopy(os.environ)
     for key in os.environ:
         # only set CLEARML_ remove any TRAINS_
-        if key.startswith("TRAINS") or (key.startswith("CLEARML") and not any(key.endswith(p) for p in preserve)):
+        if key.startswith("TRAINS") or (
+                key.startswith("CLEARML") and not any(key.endswith(p) for p in preserve_env_suffix)):
             env.pop(key, None)
 
     return env
 
 
-def monitor_jupyter_server(fd, local_filename, process, task, jupyter_port, hostnames):
+def monitor_jupyter_server(fd, local_filename, process, task, jupyter_port, hostnames, param):
     # todo: add auto spin down see: https://tljh.jupyter.org/en/latest/topic/idle-culler.html
     # print stdout/stderr
     prev_line_count = 0
     process_running = True
-    token = None
-    while process_running:
+    if param and param.get("jupyter_token") is not None or param.get("jupyter_password") is not None:
+        token = param.get("jupyter_token") or param.get("jupyter_password") or True
+    else:
+        token = None
+
+    port = None
+    tic = time()
+    # if more than 30 sec passed, we give up just break
+    while process_running and time() - tic < 31:
         process_running = False
         try:
-            process.wait(timeout=2.0 if not token else 15.0)
+            process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             process_running = True
 
@@ -193,9 +238,6 @@ def monitor_jupyter_server(fd, local_filename, process, task, jupyter_port, host
 
         print("".join(new_lines))
         prev_line_count += len(new_lines)
-        # if we already have the token, do nothing, just monitor
-        if token:
-            continue
 
         # update task with jupyter notebook server links (port / token)
         line = ''
@@ -203,9 +245,10 @@ def monitor_jupyter_server(fd, local_filename, process, task, jupyter_port, host
             if "http://" not in line and "https://" not in line:
                 continue
             parts = line.split('?token=', 1)
-            if len(parts) != 2:
-                continue
-            token = parts[1]
+            if not token:
+                if len(parts) != 2:
+                    continue
+                token = parts[1]
             port = parts[0].split(':')[-1]
             # try to cast to int
             try:
@@ -213,17 +256,20 @@ def monitor_jupyter_server(fd, local_filename, process, task, jupyter_port, host
             except (TypeError, ValueError):
                 continue
             break
+
         # we could not locate the token, try again
-        if not token:
+        if not token or not port:
             continue
 
         # we ignore the reported port, because jupyter server will get confused
         # if we have multiple servers running and will point to the wrong port/server
         task.set_parameter(name='properties/jupyter_port', value=str(jupyter_port))
-        jupyter_url = '{}://{}:{}?token={}'.format(
-            'https' if "https://" in line else 'http',
-            hostnames, jupyter_port, token
-        )
+        if token and token != True:
+            jupyter_url = '{}://{}:{}?token={}'.format(
+                'https' if "https://" in line else 'http', hostnames, jupyter_port, token)
+        else:
+            jupyter_url = '{}://{}:{}'.format('https' if "https://" in line else 'http', hostnames, jupyter_port)
+            token = ""
 
         # update the task with the correct links and token
         if Session.check_min_api_version("2.13"):
@@ -238,18 +284,10 @@ def monitor_jupyter_server(fd, local_filename, process, task, jupyter_port, host
             task.set_parameter(name='properties/jupyter_url', value=jupyter_url)
 
         print('\nJupyter Lab URL: {}\n'.format(jupyter_url))
+        # if we got here, we have a token and we can leave
+        break
 
-    # cleanup
-    # noinspection PyBroadException
-    try:
-        os.close(fd)
-    except Exception:
-        pass
-    # noinspection PyBroadException
-    try:
-        os.unlink(local_filename)
-    except Exception:
-        pass
+    return process
 
 
 def start_vscode_server(hostname, hostnames, param, task, env, bind_ip="127.0.0.1", port=None):
@@ -258,8 +296,8 @@ def start_vscode_server(hostname, hostnames, param, task, env, bind_ip="127.0.0.
 
     # get vscode version and python extension version
     # they are extremely flaky, this combination works, most do not.
-    vscode_version = '4.14.1'
-    python_ext_version = '2023.12.0'
+    vscode_version = '4.103.1'
+    python_ext_version = '2025.12.0'
     if param.get("vscode_version"):
         vscode_version_parts = param.get("vscode_version").split(':')
         vscode_version = vscode_version_parts[0]
@@ -270,54 +308,108 @@ def start_vscode_server(hostname, hostnames, param, task, env, bind_ip="127.0.0.
     env = dict(**env)
     env.pop('PYTHONPATH', None)
 
-    python_ext_download_link = \
-        os.environ.get("CLEARML_SESSION_VSCODE_PY_EXT") or \
-        'https://github.com/microsoft/vscode-python/releases/download/{}/ms-python-release.vsix'
+    # example of CLEARML_SESSION_VSCODE_PY_EXT value
+    # 'https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-python/vsextensions/python/2022.12.0/vspackage'
+    # (see https://marketplace.visualstudio.com/items?itemName=ms-python.python).
+    python_ext_download_link = os.environ.get("CLEARML_SESSION_VSCODE_PY_EXT")
+
+    # example of CLEARML_SESSION_VSCODE_SERVER_DEB value
+    # 'https://github.com/coder/code-server/releases/download/v4.96.2/code-server_4.96.2_amd64.deb'
+    # (see https://github.com/coder/code-server/releases)
+
     code_server_deb_download_link = \
         os.environ.get("CLEARML_SESSION_VSCODE_SERVER_DEB") or \
-        'https://github.com/coder/code-server/releases/download/v{version}/code-server_{version}_amd64.deb'
+        os.environ.get("CLEARML_SESSION_VSCODE_SERVER_TGZ") or \
+        'https://github.com/coder/code-server/releases/download/v{version}/code-server-{version}'
 
+    if platform.machine() == "aarch64":
+        platform_type = "arm64"
+    else:
+        platform_type = "amd64"
+
+    # support x86/arm dnf/deb
+    if (not code_server_deb_download_link.endswith(".deb") and not code_server_deb_download_link.endswith(".rpm")
+            and not code_server_deb_download_link.endswith(".tar.gz") and not code_server_deb_download_link.endswith(".tgz")):
+        code_server_deb_download_link += "-linux-{}.tar.gz".format(platform_type)
+
+    is_vscode_tgz = code_server_deb_download_link.endswith(".tar.gz") or code_server_deb_download_link.endswith(".tgz")
     pre_installed = False
     python_ext = None
+
+    base_path = Path.home() / ".local" 
+    base_vscode_ext_dir = base_path / "share" / "code-server"
 
     # find a free tcp port
     port = get_free_port(9000, 9100) if not port else int(port)
 
-    if os.geteuid() == 0:
-        # check if preinstalled
-        # noinspection PyBroadException
-        try:
-            vscode_path = subprocess.check_output('which code-server', shell=True).decode().strip()
-            pre_installed = bool(vscode_path)
-        except Exception:
-            vscode_path = None
+    # check if preinstalled
+    # noinspection PyBroadException
+    try:
+        vscode_path = shutil.which("code-server")
+        if vscode_path:
+            print("INFO: found existing vscode code-server at ({}) using it".format(vscode_path))
+    except Exception:
+        vscode_path = None
 
-        if not vscode_path:
-            # installing VSCODE:
-            try:
-                python_ext = StorageManager.get_local_copy(
-                    python_ext_download_link.format(python_ext_version),
-                    extract_archive=False)
-                code_server_deb = StorageManager.get_local_copy(
-                    code_server_deb_download_link.format(version=vscode_version),
-                    extract_archive=False)
-                os.system("dpkg -i {}".format(code_server_deb))
-            except Exception as ex:
-                print("Failed installing vscode server: {}".format(ex))
-                return
-            vscode_path = 'code-server'
-    else:
-        python_ext = None
-        pre_installed = True
-        # check if code-server exists
-        # noinspection PyBroadException
+    if not vscode_path:
+        # installing VSCODE:
         try:
-            vscode_path = subprocess.check_output('which code-server', shell=True).decode().strip()
-            assert vscode_path
-        except Exception:
-            print('Error: Cannot install code-server (not root) and could not find code-server executable, skipping.')
-            task.set_parameter(name='properties/vscode_port', value=str(-1))
-            return
+            python_ext = StorageManager.get_local_copy(
+                python_ext_download_link.format(python_ext_version),
+                extract_archive=False) if python_ext_download_link else None
+            download_url = code_server_deb_download_link.format(version=vscode_version)
+            code_server_dl = StorageManager.get_local_copy(download_url, extract_archive=False)
+            if not code_server_dl:
+                raise ValueError("Failed downloading vscode-server: {}".format(download_url))
+            
+            if is_vscode_tgz:
+                def extract_tar(base_path):
+                    base_vscode_ext_dir = base_path / "share" / "code-server"
+                    base_vscode_ext_dir.mkdir(parents=True, exist_ok=True)
+                    target_path = base_path / "bin" /"code-server"
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    with tarfile.open(code_server_dl, "r:gz") as tar:
+                        if sys.version_info >= (3, 12):
+                            tar.extractall(path=target_path, filter='fully_trusted')
+                        else:
+                            tar.extractall(path=target_path)
+                    return target_path, base_vscode_ext_dir
+
+                try:
+                    base_path = Path.home() / ".local" 
+                    target_path, base_vscode_ext_dir = extract_tar(base_path)
+                    
+                except Exception:
+                    try:
+                        base_path = Path(gettempdir()) / ".clearml.local" 
+                        target_path, base_vscode_ext_dir = extract_tar(base_path)
+                    except Exception as ex:
+                        print("ERROR: FAILED extracting and installing vscode code-server: {}".format(ex))
+                        target_path = base_vscode_ext_dir = None
+
+                if not target_path:
+                    print("ERROR: FAILED extracting and installing vscode code-server: leaving")
+                else:
+                    extracted_dir = next(Path(target_path).glob("code-server-{}-linux-{}".format(vscode_version, platform_type)))
+                    # add it to path
+                    env["PATH"] = os.environ["PATH"] = os.environ.get("PATH", "") + ":{}".format(os.path.join(os.path.abspath(extracted_dir), "bin")) 
+            else:
+                if shutil.which("dnf") and not shutil.which("dpkg"):
+                    os.system("dnf install -y {}".format(code_server_dl))
+                else:
+                    os.system("dpkg -i {}".format(code_server_dl))
+
+            vscode_path = 'code-server'    
+        
+        except Exception as ex:
+            print("Failed installing vscode server: {}".format(ex))
+            vscode_path = None
+    
+    # check if installed
+    if not vscode_path:
+        print('Error: Cannot install code-server (not root) and could not find code-server executable, skipping.')
+        task.set_parameter(name='properties/vscode_port', value=str(-1))
+        return
 
     cwd = (
         os.path.expandvars(os.path.expanduser(param["user_base_directory"]))
@@ -334,19 +426,43 @@ def start_vscode_server(hostname, hostnames, param, task, env, bind_ip="127.0.0.
 
     print("Running VSCode Server on {} [{}] port {} at {}".format(hostname, hostnames, port, cwd))
     print("VSCode Server available: http://{}:{}/\n".format(hostnames, port))
-    user_folder = os.path.join(cwd, ".vscode/user/")
-    exts_folder = os.path.join(cwd, ".vscode/exts/")
+    user_folder = os.path.expanduser(
+        _get_env_vars(
+            "CLEARML_VSCODE_USER_DATA_DIR",
+            "CLEARML_SESSION_VSCODE_USER_DATA_DIR",
+            default=os.path.join(cwd, ".vscode/user/"),
+        )
+    )
+    exts_folder = os.path.expanduser(
+        _get_env_vars(
+            "CLEARML_VSCODE_EXTENSIONS_DIR",
+            "CLEARML_SESSION_VSCODE_EXTENSIONS_DIR",
+            default=os.path.join(cwd, ".vscode/exts/"),
+        )
+    )
     proc = None
 
     try:
         fd, local_filename = mkstemp()
         if pre_installed:
-            user_folder = os.path.expanduser("~/.local/share/code-server/")
+            user_folder = os.path.expanduser(
+                _get_env_vars(
+                    "CLEARML_VSCODE_USER_DATA_DIR",
+                    "CLEARML_SESSION_VSCODE_USER_DATA_DIR",
+                    default=base_vscode_ext_dir.as_posix(),
+                )
+            )
             if not os.path.isdir(user_folder):
                 user_folder = None
                 exts_folder = None
             else:
-                exts_folder = os.path.expanduser("~/.local/share/code-server/extensions/")
+                exts_folder = os.path.expanduser(
+                    _get_env_vars(
+                        "CLEARML_VSCODE_EXTENSIONS_DIR",
+                        "CLEARML_SESSION_VSCODE_EXTENSIONS_DIR",
+                        default=(base_vscode_ext_dir / "extensions").as_posix(),
+                    )
+                )
         else:
             vscode_extensions = param.get("vscode_extensions") or ""
             vscode_extensions_cmd = []
@@ -409,6 +525,7 @@ def start_vscode_server(hostname, hostnames, param, task, env, bind_ip="127.0.0.
                     "security.workspace.trust.untrustedFiles": "open",
                     # "security.workspace.trust.startupPrompt": "never",
                     "security.workspace.trust.enabled": False,
+                    "telemetry.telemetryLevel": "off",
                 })
                 with open(settings.as_posix(), 'wt') as f:
                     json.dump(base_json, f)
@@ -465,10 +582,7 @@ def start_vscode_server(hostname, hostnames, param, task, env, bind_ip="127.0.0.
 
 def start_jupyter_server(hostname, hostnames, param, task, env, bind_ip="127.0.0.1", port=None):
     if not param.get('jupyterlab', True):
-        print('no jupyterlab to monitor - going to sleep')
-        while True:
-            sleep(10.)
-        return  # noqa
+        return
 
     # execute jupyter notebook
     fd, local_filename = mkstemp()
@@ -528,6 +642,14 @@ def start_jupyter_server(hostname, hostnames, param, task, env, bind_ip="127.0.0
     print(
         "Running Jupyter Notebook Server on {} [{}] port {} at {}".format(hostname, hostnames, port, cwd)
     )
+    additional_args = [
+        "--ServerApp.token='{}'".format(param.get("jupyter_token")) if param.get("jupyter_token") is not None else "",
+        "--ServerApp.password=''".format(param.get("jupyter_password")) if param.get("jupyter_password") is not None else "",
+        "--ServerApp.allow_origin=*".format(param.get("jupyter_allow_origin")) if param.get("jupyter_allow_origin") is not None else "",
+        "--ServerApp.base_url={}".format(param.get("jupyter_base_url")) if param.get("jupyter_base_url") is not None else "",
+    ]
+    additional_args = [a for a in additional_args if a]
+
     process = subprocess.Popen(
         [
             sys.executable,
@@ -540,13 +662,13 @@ def start_jupyter_server(hostname, hostnames, param, task, env, bind_ip="127.0.0
             bind_ip,
             "--port",
             str(port),
-        ],
+        ] + additional_args,
         env=env,
         stdout=fd,
         stderr=fd,
         cwd=cwd,
     )
-    return monitor_jupyter_server(fd, local_filename, process, task, port, hostnames)
+    return monitor_jupyter_server(fd, local_filename, process, task, port, hostnames, param)
 
 
 def setup_ssh_server(hostname, hostnames, param, task, env):
@@ -561,13 +683,27 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
 
     print("Installing SSH Server on {} [{}]".format(hostname, hostnames))
     ssh_password = param.get("ssh_password", "training")
+
+    proxy_port = port = None
+    ssh_port = None
+    if Session.check_min_api_version("2.13"):
+        try:
+            # noinspection PyProtectedMember
+            ssh_port = task._get_runtime_properties().get("internal_tcp_port")
+        except Exception as ex:
+            print("Failed retrieving internal TCP port for SSH daemon: {}".format(ex))
+
     # noinspection PyBroadException
     try:
-        ssh_port = param.get("ssh_ports") or "10022:15000"
+        ssh_port = ssh_port or param.get("ssh_ports") or "10022:15000"
         min_port = int(ssh_port.split(":")[0])
         max_port = max(min_port+32, int(ssh_port.split(":")[-1]))
         port = get_free_port(min_port, max_port)
-        proxy_port = get_free_port(min_port, max_port)
+        if param.get("use_ssh_proxy"):
+            proxy_port = port
+            port = get_free_port(min_port, max_port)
+        else:
+            proxy_port = None
         use_dropbear = bool(param.get("force_dropbear", False))
 
         # if we are root, install open-ssh
@@ -575,13 +711,14 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
             # noinspection SpellCheckingInspection
             os.system(
                 "export PYTHONPATH=\"\" && "
-                "([ ! -z $(which sshd) ] || "
-                "(apt-get update ; DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server)) && "
+                "([ ! -z $(command -v sshd) ] || "
+                "(DEBIAN_FRONTEND=noninteractive apt-get update ; DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server) || "
+                "(dnf install -y openssh-server)) && "
                 "mkdir -p /var/run/sshd && "
                 "echo 'root:{password}' | chpasswd && "
                 "echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && "
-                "sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && "
-                "sed 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' -i /etc/pam.d/sshd "
+                "sed -i 's|PermitRootLogin prohibit-password|PermitRootLogin yes|g' /etc/ssh/sshd_config && "
+                "sed -i 's|session\\s*required\\s*pam_loginuid.so|session optional pam_loginuid.so|g' /etc/pam.d/sshd "
                 "&& "  # noqa: W605
                 "echo 'ClientAliveInterval 10' >> /etc/ssh/sshd_config && "
                 "echo 'ClientAliveCountMax 20' >> /etc/ssh/sshd_config && "
@@ -590,10 +727,11 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
                 'echo "export VISIBLE=now" >> /etc/profile && '
                 'echo "export PATH=$PATH" >> /etc/profile && '
                 'echo "ldconfig" 2>/dev/null >> /etc/profile && '
-                'echo "export CLEARML_CONFIG_FILE={trains_config_file}" >> /etc/profile'.format(
+                'echo "export CLEARML_CONFIG_FILE={clearml_config_file}" >> /etc/profile'.format(
                     password=ssh_password,
                     port=port,
-                    trains_config_file=os.environ.get("CLEARML_CONFIG_FILE") or os.environ.get("TRAINS_CONFIG_FILE"),
+                    clearml_config_file=env.get("CLEARML_CONFIG_FILE") or
+                                        os.environ.get("CLEARML_CONFIG_FILE") or os.environ.get("TRAINS_CONFIG_FILE"),
                 )
             )
             sshd_path = '/usr/sbin/sshd'
@@ -603,34 +741,52 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
             # check if sshd exists
             # noinspection PyBroadException
             try:
-                os.system('echo "export CLEARML_CONFIG_FILE={trains_config_file}" >> $HOME/.profile'.format(
-                    trains_config_file=os.environ.get("CLEARML_CONFIG_FILE") or os.environ.get("TRAINS_CONFIG_FILE"),
+                os.system(
+                    'echo "export PATH=$PATH" >> $HOME/.profile && '
+                    'echo "export CLEARML_CONFIG_FILE={clearml_config_file}" >> $HOME/.profile'.format(
+                    clearml_config_file=env.get("CLEARML_CONFIG_FILE") or
+                                        os.environ.get("CLEARML_CONFIG_FILE") or os.environ.get("TRAINS_CONFIG_FILE"),
                 ))
             except Exception:
-                print("warning failed setting ~/.profile")
+                print("WARNING: failed setting ~/.profile")
 
-            # check if shd is preinstalled
+            # check if sshd is preinstalled
+            # noinspection PyBroadException
+            # try:
+            #     # try running SSHd as non-root (currently bypassed, use dropbear instead)
+            #     sshd_path = None  ## subprocess.check_output('which sshd', shell=True).decode().strip()
+            #     if not sshd_path:
+            #         raise ValueError("sshd was not found")
+            # except Exception:
+            #     print('WARNING: SSHd was not found defaulting to user-space dropbear sshd server')
+            #
+
             # noinspection PyBroadException
             try:
-                # try running SSHd as non-root (currently bypassed, use dropbear instead)
-                sshd_path = None ## subprocess.check_output('which sshd', shell=True).decode().strip()
-                if not sshd_path:
-                    raise ValueError("sshd was not found")
-            except Exception:
-                # noinspection PyBroadException
+                dropbear_download_link = (os.environ.get("CLEARML_DROPBEAR_EXEC") or
+                    'https://github.com/clearml/dropbear/releases/download/DROPBEAR_2025.88/dropbearmulti')
+
+                dropbear = StorageManager.get_local_copy(dropbear_download_link, extract_archive=False)
                 try:
-                    print('SSHd was not found default to user space dropbear sshd server')
-                    dropbear_download_link = \
-                        os.environ.get("CLEARML_DROPBEAR_EXEC") or \
-                        'https://github.com/allegroai/dropbear/releases/download/DROPBEAR_CLEARML_2023.02/dropbearmulti'
+                    os.chmod(dropbear, 0o744)
+                    if os.system("{} dropbear -V > /dev/null 2>&1".format(dropbear)):
+                        raise Exception("dropbear execution failed")
+                except Exception:
+                    if platform.machine() == "aarch64":
+                        dropbear_download_link += "_arm64"
+                    else:
+                        dropbear_download_link += "_amd64"
+
                     dropbear = StorageManager.get_local_copy(dropbear_download_link, extract_archive=False)
                     os.chmod(dropbear, 0o744)
-                    sshd_path = dropbear
-                    use_dropbear = True
-
-                except Exception:
-                    print('Error: failed locating SSHd and failed fetching `dropbear`, leaving!')
-                    return
+                    if os.system("{} dropbear -V > /dev/null 2>&1".format(dropbear)):
+                        raise Exception("dropbear execution failed")
+                # set to dropbear
+                sshd_path = dropbear
+                use_dropbear = True
+            except Exception:
+                print('Error: failed locating SSHd and failed fetching `dropbear`, leaving!')
+                return
 
             # noinspection PyBroadException
             try:
@@ -668,6 +824,15 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
                 ssh_password = None
                 task.set_parameter('{}/ssh_password'.format(config_section_name), '')
 
+        # get current user:
+        # noinspection PyBroadException
+        try:
+            current_user = getpass.getuser() or "root"
+        except Exception:
+            # we failed getting the user, let's assume root
+            print("Warning: failed getting active user name, assuming 'root'")
+            current_user = "root"
+
         # create fingerprint files
         Path(ssh_config_path).mkdir(parents=True, exist_ok=True)
         keys_filename = {}
@@ -678,11 +843,13 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
             except Exception:  # noqa
                 pass
             if v:
-                with open(filename, 'wt') as f:
-                    f.write(v + (' {}@{}'.format(
-                        getpass.getuser() or "root", hostname) if filename.endswith('.pub') else ''))
-                os.chmod(filename, 0o600 if filename.endswith('.pub') else 0o600)
-                keys_filename[k] = filename
+                try:
+                    with open(filename, 'wt') as f:
+                        f.write(v + (' {}@{}'.format(current_user, hostname) if filename.endswith('.pub') else ''))
+                    os.chmod(filename, 0o600 if filename.endswith('.pub') else 0o600)
+                    keys_filename[k] = filename
+                except Exception as ex:
+                    print('Warning: failed creating ssh key file {}: {}'.format(filename, ex))
 
         # run server in foreground so it gets killed with us
         if use_dropbear:
@@ -717,18 +884,26 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
         if result != 0:
             raise ValueError("Failed launching sshd: ", proc_args)
 
-        # noinspection PyBroadException
-        try:
-            TcpProxy(listen_port=proxy_port, target_port=port, proxy_state={}, verbose=False,  # noqa
-                     keep_connection=True, is_connection_server=True)
-        except Exception as ex:
-            print('Warning: Could not setup stable ssh port, {}'.format(ex))
-            proxy_port = None
+        if proxy_port:
+            # noinspection PyBroadException
+            try:
+                TcpProxy(listen_port=proxy_port, target_port=port, proxy_state={}, verbose=False,  # noqa
+                         keep_connection=True, is_connection_server=True)
+            except Exception as ex:
+                print('Warning: Could not setup stable ssh port, {}'.format(ex))
+                proxy_port = None
 
         if task:
             if proxy_port:
                 task.set_parameter(name='properties/internal_stable_ssh_port', value=str(proxy_port))
             task.set_parameter(name='properties/internal_ssh_port', value=str(port))
+            # noinspection PyProtectedMember
+            task._set_runtime_properties(
+                runtime_properties={
+                    'internal_ssh_port': str(proxy_port or port),
+                    '_ssh_user': current_user,
+                }
+            )
 
         print(
             "\n#\n# SSH Server running on {} [{}] port {}\n# LOGIN u:root p:{}\n#\n".format(
@@ -738,6 +913,8 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
 
     except Exception as ex:
         print("Error: {}\n\n#\n# Error: SSH server could not be launched\n#\n".format(ex))
+
+    return proxy_port or port
 
 
 def _b64_decode_file(encoded_string):
@@ -752,6 +929,27 @@ def _b64_decode_file(encoded_string):
 
 def setup_user_env(param, task):
     env = setup_os_env(param)
+
+    # create temp config file,
+    try:
+        fd, local_filename = mkstemp(".clearml.conf")
+        os.close(fd)
+        from clearml.config import config_obj
+        # make sure it's loaded
+        config_obj.get("api", None)
+        conf_dict = config_obj._config.to_dict()
+        conf_dict ={k: v for k, v in conf_dict.items() if k in ("sdk", "api")}
+        with open(local_filename, 'wt') as f:
+            json.dump(conf_dict, f)
+        env["CLEARML_CONFIG_FILE"] = local_filename
+    except Exception as ex:
+        print("Error [{}]: Failed to store new config file, using original".format(ex))
+
+    # fix casting errors
+    if str(param.get("user_key") or "").lower() == "none":
+        param["user_key"] = None
+    if str(param.get("user_secret") or "").lower() == "none":
+        param["user_secret"] = None
 
     # apply vault if we have it
     vault_environment = {}
@@ -797,6 +995,9 @@ def setup_user_env(param, task):
                 env['CLEARML_API_SECRET_KEY'] = param.get("user_secret")
             return env
 
+    # target source config
+    source_conf = '~/.clearmlrc'
+
     # create symbolic link to the venv
     environment = os.path.expanduser('~/environment')
     # noinspection PyBroadException
@@ -809,46 +1010,55 @@ def setup_user_env(param, task):
 
     # set default user credentials
     if param.get("user_key") and param.get("user_secret"):
-        os.system("echo 'export CLEARML_API_ACCESS_KEY=\"{}\"' >> ~/.bashrc".format(
-            param.get("user_key", "").replace('$', '\\$')))
-        os.system("echo 'export CLEARML_API_SECRET_KEY=\"{}\"' >> ~/.bashrc".format(
-            param.get("user_secret", "").replace('$', '\\$')))
-        os.system("echo 'export CLEARML_API_ACCESS_KEY=\"{}\"' >> ~/.profile".format(
-            param.get("user_key", "").replace('$', '\\$')))
-        os.system("echo 'export CLEARML_API_SECRET_KEY=\"{}\"' >> ~/.profile".format(
-            param.get("user_secret", "").replace('$', '\\$')))
-        env['CLEARML_API_ACCESS_KEY'] = param.get("user_key")
-        env['CLEARML_API_SECRET_KEY'] = param.get("user_secret")
+        if param.get("user_key"):
+            env['CLEARML_API_ACCESS_KEY'] = param.get("user_key")
+            os.system("echo 'export CLEARML_API_ACCESS_KEY=\"{}\"' >> {}".format(
+                param.get("user_key").replace('$', '\\$'), source_conf))
+        else:
+            env.pop('CLEARML_API_ACCESS_KEY', None)
+            os.system("echo 'export CLEARML_API_ACCESS_KEY=' >> {}".format(source_conf))
+
+        if param.get("user_secret"):
+            env['CLEARML_API_SECRET_KEY'] = param.get("user_secret")
+            os.system("echo 'export CLEARML_API_SECRET_KEY=\"{}\"' >> {}".format(
+                param.get("user_secret").replace('$', '\\$'), source_conf))
+        else:
+            env.pop('CLEARML_API_SECRET_KEY', None)
+            os.system("echo 'export CLEARML_API_SECRET_KEY=' >> {}".format(source_conf))
+
     elif os.environ.get("CLEARML_AUTH_TOKEN"):
         env['CLEARML_AUTH_TOKEN'] = os.environ.get("CLEARML_AUTH_TOKEN")
-        os.system("echo 'export CLEARML_AUTH_TOKEN=\"{}\"' >> ~/.bashrc".format(
-            os.environ.get("CLEARML_AUTH_TOKEN").replace('$', '\\$')))
-        os.system("echo 'export CLEARML_AUTH_TOKEN=\"{}\"' >> ~/.profile".format(
-            os.environ.get("CLEARML_AUTH_TOKEN").replace('$', '\\$')))
+        os.system("echo 'export CLEARML_AUTH_TOKEN=\"{}\"' >> {}".format(
+            os.environ.get("CLEARML_AUTH_TOKEN").replace('$', '\\$'), source_conf))
 
     if param.get("default_docker"):
-        os.system("echo 'export CLEARML_DOCKER_IMAGE=\"{}\"' >> ~/.profile".format(
-            param.get("default_docker", "").strip() or env.get('CLEARML_DOCKER_IMAGE', '')))
-        os.system("echo 'export CLEARML_DOCKER_IMAGE=\"{}\"' >> ~/.bashrc".format(
-            param.get("default_docker", "").strip() or env.get('CLEARML_DOCKER_IMAGE', '')))
+        os.system("echo 'export CLEARML_DOCKER_IMAGE=\"{}\"' >> {}".format(
+            (param.get("default_docker") or "").strip() or (env.get('CLEARML_DOCKER_IMAGE') or ''), source_conf))
 
     if vault_environment:
         for k, v in vault_environment.items():
-            os.system("echo 'export {}=\"{}\"' >> ~/.profile".format(k, v))
-            os.system("echo 'export {}=\"{}\"' >> ~/.bashrc".format(k, v))
+            os.system("echo 'export {}={}' >> {}".format(k, "" if v in (None, "") else "\"{}\"".format(v), source_conf))
             env[k] = str(v) if v else ""
+
+    # make sure we activate the venv in the bash
+    if Path(os.path.join(environment, 'bin', 'activate')).expanduser().exists():
+        os.system("echo 'source {}' >> {}".format(os.path.join(environment, 'bin', 'activate'), source_conf))
+    elif Path(os.path.join(environment, 'etc', 'conda', 'activate.d')).expanduser().exists():
+        # let conda patch the bashrc
+        os.system("conda init")
+        # make sure we activate this environment by default
+        os.system("echo 'conda activate {}' >> {}".format(environment, source_conf))
 
     # set default folder for user
     if param.get("user_base_directory"):
         base_dir = param.get("user_base_directory")
         if ' ' in base_dir:
             base_dir = '\"{}\"'.format(base_dir)
-        os.system("echo 'cd {}' >> ~/.bashrc".format(base_dir))
-        os.system("echo 'cd {}' >> ~/.profile".format(base_dir))
+        os.system("echo 'cd {}' >> {}".format(base_dir, source_conf))
 
-    # make sure we activate the venv in the bash
-    os.system("echo 'source {}' >> ~/.bashrc".format(os.path.join(environment, 'bin', 'activate')))
-    os.system("echo '. {}' >> ~/.profile".format(os.path.join(environment, 'bin', 'activate')))
+    # make sure we load the source configuration
+    os.system("echo 'source {}' >> ~/.bashrc".format(source_conf))
+    os.system("echo '. {}' >> ~/.profile".format(source_conf))
 
     # check if we need to create .git-credentials
 
@@ -956,15 +1166,28 @@ def get_host_name(task, param):
     except Exception:
         pass
 
+    # override if we have host name defines
+    if os.environ.get("CLEARML_AGENT_HOST_IP"):
+        hostnames = hostname = os.environ.get("CLEARML_AGENT_HOST_IP")
+
     # update host name
-    if not task.get_parameter(name='properties/external_address'):
-        external_addr = hostnames
-        if param.get('public_ip'):
-            # noinspection PyBroadException
-            try:
-                external_addr = requests.get('https://checkip.amazonaws.com').text.strip()
-            except Exception:
-                pass
+    if (not task.get_parameter(name='properties/external_address') and
+            not task.get_parameter(name='properties/k8s-gateway-address')):
+
+        if task._get_runtime_properties().get("external_address"):
+            external_addr = task._get_runtime_properties().get("external_address")
+        else:
+            external_addr = hostnames
+            if param.get('public_ip'):
+                # noinspection PyBroadException
+                try:
+                    external_addr = requests.get('https://checkip.amazonaws.com').text.strip()
+                except Exception:
+                    pass
+            # make sure we set it to the runtime properties
+            task._set_runtime_properties({"external_address": external_addr})
+
+        # make sure we set it back to the Task user properties
         task.set_parameter(name='properties/external_address', value=str(external_addr))
 
     return hostname, hostnames
@@ -1015,7 +1238,7 @@ def run_user_init_script(task):
     os.environ['CLEARML_DOCKER_BASH_SCRIPT'] = str(init_script)
 
 
-def _sync_workspace_snapshot(task, param):
+def _sync_workspace_snapshot(task, param, auto_shutdown_task):
     workspace_folder = param.get("store_workspace")
     if not workspace_folder:
         # nothing to do
@@ -1036,17 +1259,25 @@ def _sync_workspace_snapshot(task, param):
         files_desc += "{}: {}[{}]\n".format(f.absolute(), fs.st_size, fs.st_mtime)
     workspace_hash = hash(str(files_desc))
     if param.get("workspace_hash") == workspace_hash:
+        # noinspection PyPackageRequirements
+        try:
+            time_stamp = datetime.datetime.fromtimestamp(
+                param.get(sync_runtime_property)).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            time_stamp = param.get(sync_runtime_property)
+
         print("Skipping workspace snapshot upload, "
-              "already uploaded no files changed since last sync {}".format(param.get(sync_runtime_property)))
+              "already uploaded no files changed since last sync {}".format(time_stamp))
         return
 
-    print("Uploading workspace: {}".format(workspace_folder))
-
     # force running status - so that we can upload the artifact
-    if task.status not in ("in_progress", ):
+    prev_status = task.status
+    if prev_status not in ("in_progress", ):
         task.mark_started(force=True)
 
     try:
+        print("Compressing workspace: {}".format(workspace_folder))
+
         # create a tar file of the folder
         # put a consistent file name into a temp folder because the filename is part of
         # the compressed artifact, and we want consistency in hash.
@@ -1068,13 +1299,17 @@ def _sync_workspace_snapshot(task, param):
                 relative_file_name = filename.relative_to(workspace_folder)
                 archive_preview += '{} - {:,} B\n'.format(relative_file_name, filename.stat().st_size)
 
+        print("Uploading workspace: {}".format(workspace_folder))
+
         # upload actual snapshot tgz
+        timestamp = datetime.datetime.now(datetime.UTC) \
+            if hasattr(datetime, "UTC") and hasattr(datetime.datetime, "now") else datetime.datetime.utcnow()  # noqa
         task.upload_artifact(
             name=artifact_workspace_name,
             artifact_object=Path(local_gzip),
             delete_after_upload=True,
             preview=archive_preview,
-            metadata={"timestamp": str(datetime.utcnow()), sync_workspace_creating_id: task.id},
+            metadata={"timestamp": str(timestamp), sync_workspace_creating_id: task.id},
             wait_on_upload=True,
             retries=3
         )
@@ -1112,21 +1347,27 @@ def _sync_workspace_snapshot(task, param):
         param["workspace_hash"] = workspace_hash
         # noinspection PyProtectedMember
         task._set_runtime_properties(runtime_properties={sync_runtime_property: time()})
-        print("[{}] Workspace '{}' snapshot synced".format(datetime.utcnow(), workspace_folder))
+        print("[{}] Workspace '{}' snapshot synced".format(timestamp, workspace_folder))
     except Exception as ex:
         print("ERROR: Failed syncing workspace [{}]: {}".format(workspace_folder, ex))
     finally:
-        task.mark_stopped(force=True, status_message="workspace shutdown sync completed")
+        if auto_shutdown_task:
+            if prev_status in ("failed", ):
+                task.mark_failed(force=True, status_message="workspace shutdown sync completed")
+            elif prev_status in ("completed", ):
+                task.mark_completed(force=True, status_message="workspace shutdown sync completed")
+            else:
+                task.mark_stopped(force=True, status_message="workspace shutdown sync completed")
 
 
-def sync_workspace_snapshot(task, param):
+def sync_workspace_snapshot(task, param, auto_shutdown_task=True):
     __poor_lock.append(time())
     if len(__poor_lock) != 1:
         # someone is already in, we should leave
         __poor_lock.pop(-1)
 
     try:
-        return _sync_workspace_snapshot(task, param)
+        return _sync_workspace_snapshot(task, param, auto_shutdown_task=auto_shutdown_task)
     finally:
         __poor_lock.pop(-1)
 
@@ -1136,7 +1377,7 @@ def restore_workspace(task, param):
         # check if we have something to restore, show warning
         if artifact_workspace_name in task.artifacts:
             print("WARNING: Found workspace snapshot, but ignoring since store_workspace is 'None'")
-        return
+        return None
 
     # add sync callback, timeout 5 min
     print("Setting workspace snapshot sync callback on session end")
@@ -1150,21 +1391,25 @@ def restore_workspace(task, param):
     except Exception as ex:
         print("ERROR: Could not create workspace folder {}: {}".format(
             param.get("store_workspace"), ex))
-        return
+        return None
 
     if artifact_workspace_name not in task.artifacts:
         print("No workspace snapshot was found, a new workspace snapshot [{}] "
               "will be created when session ends".format(workspace_folder))
-        return
+        return None
 
     print("Fetching previous workspace snapshot")
     artifact_zip_file = task.artifacts[artifact_workspace_name].get_local_copy(extract_archive=False)
+    if not artifact_zip_file:
+        print("Error: Fetching previous workspace snapshot Failed! skipping workspace restore")
+        return None
+
     print("Restoring workspace snapshot")
     try:
         shutil.unpack_archive(artifact_zip_file, extract_dir=workspace_folder.as_posix())
     except Exception as ex:
         print("ERROR: restoring workspace snapshot failed: {}".format(ex))
-        return
+        return None
 
     # remove the workspace from the cache
     try:
@@ -1176,9 +1421,427 @@ def restore_workspace(task, param):
     # set time stamp
     # noinspection PyProtectedMember
     task._set_runtime_properties(runtime_properties={sync_runtime_property: time()})
+    return workspace_folder
+
+
+def verify_workspace_storage_access(store_workspace, task):
+    # notice this function will call EXIT if we do not have access rights to the output storage
+    if not store_workspace:
+        return True
+
+    # check that we have credentials to upload the artifact,
+    try:
+        original_output_uri = task.output_uri
+        task.output_uri = task.output_uri or True
+        task.output_uri = original_output_uri
+    except ValueError as ex:
+        print(
+            "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "Error!\n"
+            "  `store_workspace` requested but target storage is not accessible!\n"
+            "  \n"
+            "  Storage configuration server error - could not store working session\n"
+            "  If you are using GS/Azure/S3 (or compatible) make sure to\n"
+            "  1. Verify your credentials in the ClearML Vault\n"
+            "  2. Add the relevant python package to the session:\n"
+            "      Azure: azure-storage-blob>=12.0.0\n"
+            "      GS: google-cloud-storage>=1.13.2\n"
+            "      S3: boto3>=1.9\n"
+            "Exception:\n"
+            f"{ex}\n"
+            "*************************************************************************\n"
+            "*************************************************************************\n"
+        )
+        # do not throw the exception itself, because it will confuse readers
+        exit(1)
+
+
+class SyncCallback:
+    pipe_file_name_c = "clearml_sync_pipe_c"
+    pipe_file_name_r = "clearml_sync_pipe_r"
+    magic = "DEFAULT"
+    cmd_file = "clearml-sync-workspace"
+    _original_stdout_write = None
+    _original_stderr_write = None
+    ssh_banner = [
+        "#!/bin/bash",
+        "echo \"\"",
+        "echo \"ClearML-Session:\"",
+        "echo \" * Workspace at {workspace_dir} will be automatically synced at the end of the session, "
+        "or manually by running '{clearml_sync_cmd}' command\"",
+        "echo \" * Close session from the web UI or by running 'shutdown' command as root.\"",
+        "echo \"\"",
+        "",
+    ]
+    singleton = None
+
+    def __init__(
+            self,
+            sync_function: callable = None,
+            monitor_process: subprocess.Popen = None,
+            workspace_dir: str = None
+    ):
+        self.magic = str(uuid4())
+        self._fd = None
+        self._sync_func = sync_function
+        self._monitor_process = monitor_process
+        self._workspace_dir = workspace_dir
+        self._path_dir = None
+        SyncCallback.singleton = self
+        tmp_dir = Path(mkdtemp(prefix='session_'))
+        self.pipe_file_name_c = tmp_dir / SyncCallback.pipe_file_name_c
+        self.pipe_file_name_r = tmp_dir / SyncCallback.pipe_file_name_r
+
+    def init(self):
+        if self._sync_func:
+            try:
+                self._create_sync_object()
+                self._write_sync_cmd_file()
+            except Exception as ex:
+                print("Failed to create sync object: {}".format(ex))
+
+        try:
+            self._create_monitor_process()
+            self._shutdown_cmd()
+        except Exception as ex:
+            print("Failed to create shutdown cmd: {}".format(ex))
+
+        try:
+            self._write_ssh_banner()
+        except Exception as ex:
+            print("Failed to create ssh banner: {}".format(ex))
+
+    def background_sync_thread(self) -> None:
+        if not self._sync_func:
+            return
+
+        while True:
+            try:
+                # Open the pipe for reading
+                with open(self.pipe_file_name_c, 'rt') as pipe:
+                    command = pipe.read().strip()
+                    if not command or command.split(":", 1)[0] != self.magic:
+                        continue
+                    command = command.split(":", 1)[-1]
+                    if not command:
+                        continue
+
+                    print(f"Received command: {command}")
+                    if not os.path.exists(self.pipe_file_name_r):
+                        os.mkfifo(self.pipe_file_name_r, 0o644)
+
+                    timestamp = command.split("=", 1)[-1]
+
+                    with open(self.pipe_file_name_r, 'wb') as pipe_out:
+                        self._fd = pipe_out
+                        # so that we push all our prints
+                        self._patch_stdout()
+
+                        try:
+                            self._sync_func()
+                        except Exception as ex:
+                            print("WARNING: sync callback failed [{}]: {}".format(self._sync_func, ex))
+
+                        try:
+                            pipe_out.write("\nEOF={}\n".format(timestamp).encode())
+                        except Exception as ex:
+                            self._restore_stdout()
+                            print("Exception occurred while syncing: {}".format(ex))
+
+                        # restore original stdout/stderr
+                        self._restore_stdout()
+
+                    self._fd = None
+
+            except Exception as ex:
+                self._restore_stdout()
+                self._fd = None
+                print("Exception occurred while waiting for sync request: {}\nWaiting for 5 seconds...".format(ex))
+                sleep(5)
+
+        # maybe we will get here
+        os.remove(self.pipe_file_name_r)
+        os.remove(self.pipe_file_name_c)
+
+    def wait_on_process(self, run_background_sync_thread=True, call_sync_callback_on_return=True):
+        if not self._monitor_process:
+            # if we do not have a process to wait just call the sync background
+            if run_background_sync_thread:
+                self.background_sync_thread()
+        else:
+            # start background thread
+            if run_background_sync_thread:
+                Thread(target=self.background_sync_thread, daemon=True).start()
+            # wait on process
+            self._monitor_process.wait()
+
+        if call_sync_callback_on_return and self._sync_func:
+            self._sync_func()
+
+    def _create_sync_object(self) -> object:
+        # Create the named pipe if it doesn't exist
+        if not os.path.exists(self.pipe_file_name_c):
+            os.mkfifo(self.pipe_file_name_c, 0o644)
+        if not os.path.exists(self.pipe_file_name_r):
+            os.mkfifo(self.pipe_file_name_r, 0o644)
+
+    def _create_monitor_process(self):
+        if self._monitor_process:
+            return
+        sleep_cmd = shutil.which("sleep")
+        self._monitor_process = subprocess.Popen([sleep_cmd, "999d"], shell=False)
+
+    def _write_sync_cmd_file(self):
+        import inspect
+        source_function = inspect.getsource(_sync_cmd_function)
+        source_function = "#!{}\n\n".format(sys.executable) + source_function
+        source_function = source_function.replace("SyncCallback.pipe_file_name_c",
+                                                  "\"{}\"".format(self.pipe_file_name_c))
+        source_function = source_function.replace("SyncCallback.pipe_file_name_r",
+                                                  "\"{}\"".format(self.pipe_file_name_r))
+        source_function = source_function.replace("SyncCallback.magic", "\"{}\"".format(self.magic))
+        source_function += "\nif __name__ == \"__main__\":\n    {}()\n".format("_sync_cmd_function")
+        # print("source_function:\n```\n{}\n```".format(source_function))
+
+        full_path = None
+        path_folders = os.environ.get("PATH", "/usr/bin").split(os.pathsep)
+        path_folders += ["/tmp/.clearml.session.cmd/"]
+        if self._path_dir:
+            path_folders = [self._path_dir] + path_folders
+        last_ex = None
+        for i, p in enumerate(path_folders):
+            # noinspection PyBroadException
+            try:
+                p = Path(p)
+                # create the last temp folder, the one we added
+                if i == len(path_folders) - 1:
+                    p.mkdir(parents=True, exist_ok=True)
+
+                if not p.is_dir():
+                    continue
+
+                full_path = Path(p) / self.cmd_file
+                full_path.touch(exist_ok=True)
+
+                with open(full_path, "wt") as f:
+                    f.write(source_function)
+                os.chmod(full_path, 0o777)
+
+                if p.as_posix() not in path_folders:
+                    os.environ["PATH"] = (
+                            os.environ.get("PATH").rstrip(os.pathsep) + "{}{}".format(os.pathsep, p))
+                break
+            except Exception as ex:
+                last_ex = ex
+                if full_path:
+                    # noinspection PyBroadException
+                    try:
+                        Path(full_path).unlink()
+                    except Exception:
+                        pass
+                    full_path = None
+
+        if not full_path:
+            print("ERROR: Failed to create sync execution cmd: {}".format(last_ex))
+            return
+        self._path_dir = full_path.as_posix()
+        print("Creating sync command in: {}".format(full_path))
+
+    def _write_ssh_banner(self):
+        banner_file = Path("/etc/update-motd.d/")
+        make_exec = False
+        if banner_file.is_dir():
+            banner_file = banner_file / "99-clearml"
+            make_exec = True
+        else:
+            banner_file = Path("/etc/profile").expanduser()
+
+        # noinspection PyBroadException
+        try:
+            banner_file.touch(exist_ok=True)
+        except Exception:
+            banner_file = Path("~/.profile").expanduser()
+            # noinspection PyBroadException
+            try:
+                banner_file.touch(exist_ok=True)
+            except Exception:
+                print("WARNING: failed creating ssh banner")
+                return
+
+        try:
+            with open(banner_file, "at") as f:
+                ssh_banner = self.ssh_banner
+
+                # skip first `#!/bin/bash` line if this is not an executable, and add a new line instead
+                if not make_exec:
+                    ssh_banner = [""] + ssh_banner[1:]
+
+                f.write("\n".join(ssh_banner).format(
+                    workspace_dir=self._workspace_dir, clearml_sync_cmd=self.cmd_file
+                ))
+
+            if make_exec:
+                os.chmod(banner_file.as_posix(), 0o755)
+
+        except Exception as ex:
+            print("WARNING: Failed to write to banner {}: {}".format(banner_file, ex))
+
+    def _shutdown_cmd(self):
+        batch_command = [
+            "#!/bin/bash",
+            "[ \"$UID\" -ne 0 ] && echo \"shutdown: Permission denied. Try as root.\" && exit 1",
+            "[ ! -f /tmp/.clearml.session.pid ] && echo \"shutdown: failed.\" && exit 2",
+            "[ ! -z $(command -v {}) ] && echo \"Syncing workspace\" && {}".format(self.cmd_file, self.cmd_file),
+            "kill -9 $(cat /tmp/.clearml.session.pid 2>/dev/null) && echo \"system is now spinning down - "
+            "it might take a minute if we need to upload the workspace:\""
+            " && for ((i=180; i>=0; i--)); do echo -n \" .\"; sleep 1; done",
+            ""
+        ]
+
+        if not self._monitor_process:
+            return
+
+        # if we are not running as root, remove the root check
+        if os.getuid() != 0:
+            batch_command = [batch_command[0]] + batch_command[2:]
+
+        path_folders = os.environ.get("PATH", "/usr/bin").split(os.pathsep)
+        if self._path_dir:
+            path_folders = [self._path_dir] + path_folders
+
+        last_ex = None
+        shutdown_cmd = None
+        for p in path_folders:
+            shutdown_cmd_directory = Path(p)
+            if not shutdown_cmd_directory.is_dir():
+                continue
+
+            # noinspection PyBroadException
+            try:
+                (Path(p) / "shutdown").unlink()
+            except Exception:
+                pass
+
+            try:
+                shutdown_cmd = shutdown_cmd_directory / "shutdown"
+                with open(shutdown_cmd, "wt") as f:
+                    f.write("\n".join(batch_command))
+                os.chmod(shutdown_cmd.as_posix(), 0o755)
+                break
+            except Exception as ex:
+                last_ex = ex
+                shutdown_cmd = None
+
+        if not shutdown_cmd:
+            print("WARNING: Failed to write to shutdown cmd: {}".format(last_ex))
+
+        try:
+            with open("/tmp/.clearml.session.pid", "wt") as f:
+                f.write("{}".format(self._monitor_process.pid))
+        except Exception as ex:
+            print("WARNING: Failed to write to run pid: {}".format(ex))
+
+    def _stdout__patched__write__(self, is_stderr, *args, **kwargs):
+        write_func = self._original_stderr_write if is_stderr else self._original_stdout_write
+        ret = write_func(*args, **kwargs)  # noqa
+
+        if self._fd:
+            message = args[0] if len(args) > 0 else None
+            if message is not None:
+                try:
+                    message = str(message)
+                    if "\n" not in message:
+                        message = message + "NEOL\n"
+                    self._fd.write(message.encode())
+                    self._fd.flush()
+                except Exception as ex:
+                    self._original_stderr_write(" WARNING: failed sending stdout over pipe: {}\n".format(ex))
+
+        return ret
+
+    def _patch_stdout(self):
+        if not self._original_stdout_write:
+            self._original_stdout_write = sys.stdout.write
+        if not self._original_stderr_write:
+            self._original_stderr_write = sys.stderr.write
+        sys.stdout.write = partial(self._stdout__patched__write__, False,)
+        sys.stderr.write = partial(self._stdout__patched__write__, True,)
+
+    def _restore_stdout(self):
+        if self._original_stdout_write:
+            sys.stdout.write = self._original_stdout_write
+            self._original_stdout_write = None
+        if self._original_stderr_write:
+            sys.stderr.write = self._original_stderr_write
+            self._original_stderr_write = None
+
+
+def _sync_cmd_function():
+    # this is where we put all the imports and the sync call back
+    import os
+    import sys
+    from time import time
+
+    print("Storing workspace to persistent storage")
+    try:
+        if not os.path.exists(SyncCallback.pipe_file_name_c):
+            os.mkfifo(SyncCallback.pipe_file_name_c, 0o644)
+    except Exception as ex:
+        print("ERROR: Failed creating request pipe {}".format(ex))
+
+    # push the request
+    timestamp = str(time())
+    try:
+        with open(SyncCallback.pipe_file_name_c, 'wt') as pipe:
+            cmd = "{}:sync={}".format(SyncCallback.magic, timestamp)
+            pipe.write(cmd)
+    except Exception as ex:
+        print("ERROR: Failed sending sync request {}".format(ex))
+
+    # while we did not get EOF
+    try:
+        # Read the result from the server
+        with open(SyncCallback.pipe_file_name_r, 'rb') as pipe:
+            while True:
+                result = pipe.readline()
+                if not result:
+                    break
+                result = result.decode()
+
+                if result.endswith("NEOL\n"):
+                    result = result[:-5]
+
+                # read from fd
+                if "EOF=" in result:
+                    stop = False
+                    for l in result.split("\n"):
+                        if not l.startswith("EOF="):
+                            sys.stdout.write(l+"\n")
+                        elif l.endswith("={}".format(timestamp)):
+                            stop = True
+
+                    if stop:
+                        print("Workspace synced successfully")
+                        break
+                else:
+                    sys.stdout.write(result)
+
+    except Exception as ex:
+        print("ERROR: Failed reading sync request result {}".format(ex))
 
 
 def main():
+    # noinspection PyBroadException
+    try:
+        Task.set_resource_monitor_iteration_timeout(
+            seconds_from_start=1,
+            wait_for_first_iteration_to_start_sec=1,  # noqa
+            max_wait_for_first_iteration_to_start_sec=1  # noqa
+        )  # noqa
+    except Exception:
+        pass
+
     param = {
         "user_base_directory": "~/",
         "ssh_server": True,
@@ -1194,10 +1857,20 @@ def main():
         "ssh_ports": None,
         "force_dropbear": False,
         "store_workspace": None,
+        "use_ssh_proxy": False,
+        "router_enabled": False,
     }
     task = init_task(param, default_ssh_fingerprint)
 
+    # if router is enabled, do not request a public IP, enforce local IP
+    if param.get("router_enabled") and param.get("public_ip"):
+        print("External TCP router configured, disabling `public_ip` request")
+        param["public_ip"] = False
+
     run_user_init_script(task)
+
+    # notice this function will call EXIT if we do not have access rights to the output storage
+    verify_workspace_storage_access(store_workspace=param.get("store_workspace"), task=task)
 
     # restore workspace if exists
     # notice, if "store_workspace" is not set we will Not restore the workspace
@@ -1206,19 +1879,65 @@ def main():
     except Exception as ex:
         print("ERROR: Failed restoring workspace: {}".format(ex))
 
+    # make the new user base folder the workspace directory
+    if (param["store_workspace"] or "").strip():
+        param["user_base_directory"] = param["store_workspace"]
+
     hostname, hostnames = get_host_name(task, param)
 
     env = setup_user_env(param, task)
 
-    setup_ssh_server(hostname, hostnames, param, task, env)
+    ssh_port = setup_ssh_server(hostname, hostnames, param, task, env)
+
+    # make sure we set it to the runtime properties
+    if ssh_port:
+        ext_ssh_port = 0
+        # noinspection PyProtectedMember
+        if task._get_runtime_properties().get("_external_host_tcp_port_mapping"):
+            # noinspection PyProtectedMember
+            ext_port_mapping = task._get_runtime_properties().get("_external_host_tcp_port_mapping")
+            for port_map in ext_port_mapping.split(","):
+                if port_map.split(":")[-1] == str(ssh_port):
+                    ext_ssh_port = port_map.split(":")[0]
+                    break
+
+        if not ext_ssh_port:
+            ext_ssh_port = ssh_port
+        # noinspection PyProtectedMember
+        address = task._get_runtime_properties().get("external_address") or hostnames
+        print("Requesting TCP route from router ingress to {} port {}".format(address, ssh_port))
+        # noinspection PyProtectedMember
+        task._set_runtime_properties({
+            "external_address": address,
+            "external_tcp_port": str(ext_ssh_port),
+            "_SERVICE": "EXTERNAL_TCP",
+        })
+
+        # ask the router to set routing to us
+        if param.get("router_enabled"):
+            task.set_system_tags((task.get_system_tags() or []) + ["external_service"])
 
     start_vscode_server(hostname, hostnames, param, task, env)
 
-    start_jupyter_server(hostname, hostnames, param, task, env)
+    # Notice we can only monitor the jupyter server because the vscode/ssh do not have "quit" interface
+    # we add `shutdown` command below
+    jupyter_process = start_jupyter_server(hostname, hostnames, param, task, env)
 
-    print('We are done - sync workspace if needed')
+    syncer = SyncCallback(
+        sync_function=partial(sync_workspace_snapshot, task, param, False),
+        monitor_process=jupyter_process,
+        workspace_dir=param.get("store_workspace")
+    )
+    syncer.init()
+    # notice this will end when process is done
+    print('Wait until shutdown')
+    syncer.wait_on_process(run_background_sync_thread=True, call_sync_callback_on_return=True)
 
-    sync_workspace_snapshot(task, param)
+    print('We are done')
+    # no need to sync the process, syncer.wait_on_process already did that
+
+    # sync back python packages for next time
+    # TODO: sync python environment
 
     print('Goodbye')
 

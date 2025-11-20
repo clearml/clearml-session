@@ -7,10 +7,12 @@ import subprocess
 import sys
 from pathlib import Path
 from argparse import ArgumentParser, FileType
-from functools import reduce
+from functools import reduce, partial
 from getpass import getpass
 from io import TextIOBase, StringIO
+from tempfile import NamedTemporaryFile
 from time import time, sleep
+from uuid import uuid4
 
 if sys.platform == 'win32':
     import msvcrt  # noqa
@@ -20,8 +22,15 @@ else:
     import pexpect  # noqa
 
 import psutil
+
+try:
+    import tqdm
+except ImportError:
+    tqdm = None
+
 from clearml import Task
 from clearml.backend_api.session.client import APIClient, APIError
+from clearml.backend_api.services import tasks
 from clearml.config import config_obj
 from clearml.backend_api import Session
 from .tcp_proxy import TcpProxy
@@ -36,6 +45,7 @@ except Exception:
 
 system_tag = 'interactive'
 default_docker_image = 'nvidia/cuda:11.6.2-runtime-ubuntu20.04'
+internal_tcp_port_request = 10022
 
 
 class NonInteractiveError(Exception):
@@ -146,7 +156,28 @@ def _get_available_ports(list_initial_ports):
     return available_ports
 
 
-def create_base_task(state, project_name=None, task_name=None, continue_task_id=None, project_id=None):
+def request_task_abort(task, force=False, status_message=None):
+    res = task.send(
+        tasks.StopRequest(
+            task.id, force=False,
+            status_reason="abort request",
+            status_message=status_message),
+        ignore_errors=True
+    )
+    # if we failed to request, mark it stopped
+    if res and not res.ok():
+        print(f"INFO: failed sending abort request, forcefully stopping task {task.id}")
+        task.mark_stopped(
+            force=force,
+            status_message=status_message,
+            status_reason="abort request failed, setting forcefully"
+        )
+        return True
+
+    return res
+
+
+def create_base_task(state, project_name=None, task_name=None, continue_task_id=None, project_id=None, add_tcp_proxy=True):
     if continue_task_id:
         task = Task.clone(
             source_task=continue_task_id,
@@ -162,18 +193,28 @@ def create_base_task(state, project_name=None, task_name=None, continue_task_id=
         )
 
     task_script = task.data.script.to_dict()
-    base_script_file = os.path.abspath(os.path.join(__file__, '..', 'tcp_proxy.py'))
-    with open(base_script_file, 'rt') as f:
-        task_script['diff'] = f.read()
+
+    if add_tcp_proxy:
+        base_script_file = os.path.abspath(os.path.join(__file__, '..', 'tcp_proxy.py'))
+        with open(base_script_file, 'rt') as f:
+            # notice lines always end with \n
+            task_script['diff'] = "".join([line for line in f.readlines() if not line.lstrip().startswith("#")])
+    else:
+        task_script['diff'] = ""
+
     base_script_file = os.path.abspath(os.path.join(__file__, '..', 'interactive_session_task.py'))
     with open(base_script_file, 'rt') as f:
-        task_script['diff'] += '\n\n' + f.read()
+        task_script['diff'] += "\n\n"
+        # notice lines always end with \n
+        task_script['diff'] += "".join([line for line in f.readlines() if not line.lstrip().startswith("#")])
 
     task_script['working_dir'] = '.'
     task_script['entry_point'] = '.interactive_session.py'
     task_script['requirements'] = {'pip': '\n'.join(
         ["clearml>=1.1.5"] +
         (["jupyter", "jupyterlab", "jupyterlab_git", "traitlets"] if state.get('jupyter_lab') else []) +
+        (["boto3>=1.9", "azure-storage-blob>=12.0.0", "google-cloud-storage>=1.13.2"]
+         if not state.get('disable_storage_packages') else []) + \
         (['pylint'] if state.get('vscode_server') else []))}
 
     section, _, _ = _get_config_section_name()
@@ -186,6 +227,7 @@ def create_base_task(state, project_name=None, task_name=None, continue_task_id=
             "_user_secret": '',
             "_jupyter_token": '',
             "_ssh_password": "training",
+            "internal_tcp_port_request": str(internal_tcp_port_request),
         })
         # noinspection PyProtectedMember
         task._set_runtime_properties(_runtime_prop)
@@ -241,7 +283,7 @@ def create_debugging_task(state, debug_task_id, task_name=None, task_project_id=
 
     base_script_file = os.path.abspath(os.path.join(__file__, '..', 'interactive_session_task.py'))
     with open(base_script_file, 'rt') as f:
-        entry_diff = ['+'+line.rstrip() for line in f.readlines()]
+        entry_diff = ['+'+line.rstrip() for line in f.readlines() if not line.lstrip().startswith("#")]
     entry_diff_header = \
         "diff --git a/__interactive_session__.py b/__interactive_session__.py\n" \
         "--- a/__interactive_session__.py\n" \
@@ -255,6 +297,8 @@ def create_debugging_task(state, debug_task_id, task_name=None, task_project_id=
     state['packages'] = \
         (state.get('packages') or []) + ["clearml"] + \
         (["jupyter", "jupyterlab", "jupyterlab_git", "traitlets"] if state.get('jupyter_lab') else []) + \
+        (["boto3>=1.9", "azure-storage-blob>=12.0.0", "google-cloud-storage>=1.13.2"]
+         if not state.get('disable_storage_packages') else []) + \
         (['pylint'] if state.get('vscode_server') else [])
     task.update_task(task_state)
     section, _, _ = _get_config_section_name()
@@ -267,6 +311,7 @@ def create_debugging_task(state, debug_task_id, task_name=None, task_project_id=
             "_user_secret": '',
             "_jupyter_token": '',
             "_ssh_password": "training",
+            "internal_tcp_port_request": str(internal_tcp_port_request),
         })
         # noinspection PyProtectedMember
         task._set_runtime_properties(_runtime_prop)
@@ -301,41 +346,59 @@ def find_prev_session(state, client):
     if not state.get("store_workspace"):
         return
 
-    current_user_id = _get_user_id(client)
-    previous_tasks = client.tasks.get_all(**{
-        'status': ['failed', 'stopped', 'completed'],
-        'system_tags': [system_tag],
-        'page_size': 100, 'page': 0,
-        'order_by': ['-last_update'],
-        'user': [current_user_id],
-        'only_fields': ['id']
-    })
-
     continue_session_id = state.get("continue_session")
+    if continue_session_id:
+        previous_tasks = client.tasks.get_all(**{
+            'id': [continue_session_id],
+            'system_tags': [system_tag],
+            'page_size': 20, 'page': 0,
+            'order_by': ['-last_update'],
+            'only_fields': ['id', 'name', 'execution.artifacts', 'last_update']
+        })
+    else:
+        current_user_id = _get_user_id(client)
+        previous_tasks = client.tasks.get_all(**{
+            'status': ['failed', 'stopped', 'completed'],
+            'system_tags': [system_tag],
+            'page_size': 20, 'page': 0,
+            'order_by': ['-last_update'],
+            'user': [current_user_id],
+            'only_fields': ['id', 'name', 'execution.artifacts', 'last_update']
+        })
+
     # if we do not find something, we ignore it
     state["continue_session"] = None
 
     for i, t in enumerate(previous_tasks):
         try:
-            task = Task.get_task(task_id=t.id)
-            if state.get("store_workspace") and task.artifacts:
+            if (state.get("store_workspace") and t.data.execution.artifacts and
+                    "workspace" in [a.key for a in t.data.execution.artifacts]):
                 if continue_session_id and continue_session_id == t.id:
                     print("Restoring workspace from previous session id={} [{}]".format(
-                        continue_session_id, task.data.last_update))
+                        continue_session_id, t.data.last_update))
                     state["continue_session"] = t.id
                     break
                 elif not continue_session_id and i == 0:
                     if not state.get("yes"):
                         choice = input("Restore workspace from session id={} '{}' @ {} [Y]/n? ".format(
-                            t.id, task.name, str(task.data.last_update).split(".")[0]))
+                            t.id, t.data.name, str(t.data.last_update).split(".")[0]))
                         if str(choice).strip().lower() in ('n', 'no'):
-                            continue
+                            # we only try the first match (i.e. continue our last session), otherwise skip
+                            break
 
                     print("Restoring workspace from previous session id={}".format(t.id))
                     state["continue_session"] = t.id
                     break
+                elif not continue_session_id and i > 0:
+                    # we only try the first match (i.e. continue our last session), otherwise skip
+                    break
+
         except Exception as ex:
             logging.getLogger().warning('Failed retrieving old session {}:'.format(t.id, ex))
+
+    if continue_session_id and not state["continue_session"]:
+        logging.getLogger().warning(
+            'Failed retrieving previous session id={}: skipping restore session'.format(continue_session_id))
 
 
 def delete_old_tasks(state, client, base_task_id, skip_latest_session=True):
@@ -349,19 +412,27 @@ def delete_old_tasks(state, client, base_task_id, skip_latest_session=True):
         'status': ['failed', 'stopped', 'completed'],
         'parent': base_task_id or None,
         'system_tags': None if base_task_id else [system_tag],
-        'page_size': 100, 'page': 0,
+        'page_size': 20, 'page': 0,
         'order_by': ['-last_update'],
         'user': [current_user_id],
         'only_fields': ['id']
     })
 
-    for i, t in enumerate(previous_tasks):
+    if not state.get("yes"):
+        choice = input('Remove #{} stale interactive sessions [Y]/n? '.format(len(previous_tasks)))
+        if str(choice).strip().lower() in ('n', 'no'):
+            return
+        
+    print('Removing #{} stale sessions'.format(len(previous_tasks)))
+
+    for i, t in enumerate(previous_tasks if not tqdm else tqdm.tqdm(previous_tasks)):
         # skip the selected Task which has our new workspace
         if state.get("continue_session") == t.id:
             continue
 
         if state.get('verbose'):
-            print('Removing {}/{} stale sessions'.format(i+1, len(previous_tasks)))
+            print('Checking session {}/{}'.format(i+1, len(previous_tasks)))
+        
         # no need to worry about workspace snapshots,
         # because they are input artifacts and thus will Not actually be deleted
         # we will delete them manually if the Task has its own workspace snapshot
@@ -371,6 +442,9 @@ def delete_old_tasks(state, client, base_task_id, skip_latest_session=True):
             if skip_latest_session and task.artifacts and i == 0:
                 # do not delete this workspace yet (only next time)
                 continue
+
+            if state.get('verbose'):
+                print('Removing stale session {}/{}'.format(i+1, len(previous_tasks)))
 
             task.delete(
                 delete_artifacts_and_models=True,
@@ -393,9 +467,10 @@ def _get_running_tasks(client, prev_task_id):
         'page_size': 10, 'page': 0,
         'order_by': ['-last_update'],
         'user': [current_user_id],
-        'only_fields': ['id', 'created', 'parent']
+        'only_fields': ['id', 'created', 'parent', 'status_message']
     })
-    tasks_id_created = [(t.id, t.created, t.parent) for t in previous_tasks]
+    tasks_id_created = [(t.id, t.created, t.parent) for t in previous_tasks
+                        if "stopping" not in (t.status_message or "")]
     if prev_task_id and prev_task_id not in (t[0] for t in tasks_id_created):
         # manually check the last task.id
         try:
@@ -404,13 +479,13 @@ def _get_running_tasks(client, prev_task_id):
                 'id': [prev_task_id],
                 'page_size': 10, 'page': 0,
                 'order_by': ['-last_update'],
-                'only_fields': ['id', 'created', 'parent']
+                'only_fields': ['id', 'created', 'parent', 'status_message']
             })
         except APIError:
             # we could not find previous task, nothing to worry about.
             prev_tasks = None
 
-        if prev_tasks:
+        if prev_tasks and "stopping" not in (prev_tasks[0].status_message or ""):
             tasks_id_created += [(prev_tasks[0].id, prev_tasks[0].created, prev_tasks[0].parent)]
 
     return tasks_id_created
@@ -464,7 +539,7 @@ def get_user_inputs(args, parser, state, client):
 
     for a in user_args:
         v = getattr(args, a, None)
-        if a in ('requirements', 'packages', 'attach', 'config_file'):
+        if a in ('requirements', 'packages', 'attach', 'config_file', 'randomize'):
             continue
         if isinstance(v, TextIOBase):
             state[a] = v.read()
@@ -487,9 +562,10 @@ def get_user_inputs(args, parser, state, client):
                 "\nCould not locate previously used value of '{}', please provide it?"
                 "\n    Help: {}\n> ".format(
                     a, parser._option_string_actions['--{}'.format(a.replace('_', '-'))].help))
+
     # if no password was set, create a new random one
-    if not state.get('password'):
-        state['password'] = hashlib.sha256("seed me Seymour {}".format(time()).encode()).hexdigest()
+    if not state.get('password') or state.get("randomize") is not False:
+        state['password'] = hashlib.sha256("seed me {} {}".format(uuid4(), time()).encode()).hexdigest()
 
     # store the requirements from the requirements.txt
     # override previous requirements
@@ -552,6 +628,10 @@ def ask_launch(args):
 
 
 def save_state(state, state_file):
+    # if disable_store_defaults skip storing the new state
+    if state.get('disable_store_defaults'):
+        return
+
     # if we are running in debugging mode,
     # only store the current task (do not change the defaults)
     if state.get('debugging_session'):
@@ -565,8 +645,10 @@ def save_state(state, state_file):
     with open(state_file, 'wt') as f:
         json.dump(state, f, sort_keys=True)
 
+    print("INFO: current configuration stored as new default")
 
-def load_state(state_file):
+
+def load_state(state_file, args=None):
     # noinspection PyBroadException
     try:
         with open(state_file, 'rt') as f:
@@ -579,6 +661,26 @@ def load_state(state_file):
     state.pop('shell', None)
     state.pop('upload_files', None)
     state.pop('continue_session', None)
+    state.pop('disable_store_defaults', None)
+    state.pop('disable_fingerprint_check', None)
+
+    # update back based on args
+    if args:
+        # make sure we can override randomize
+        if "always" in (state.get("randomize") or []) and args.randomize is not False:
+            state["randomize"] = []
+        elif args.randomize is False and "always" not in (state.get("randomize") or []):
+            state["randomize"] = False
+        elif "always" in (args.randomize or []):
+            state["randomize"] = ["always"]
+
+        if args.verbose:
+            state['verbose'] = args.verbose
+
+        state['shell'] = bool(args.shell)
+        state['disable_store_defaults'] = bool(args.disable_store_defaults)
+        state['disable_fingerprint_check'] = bool(args.disable_fingerprint_check)
+
     return state
 
 
@@ -612,7 +714,8 @@ def clone_task(state, project_id=None):
             project_name=state.get('project'),
             task_name=state.get('session_name'),
             continue_task_id=state.get('continue_session'),
-            project_id=project_id
+            project_id=project_id,
+            add_tcp_proxy=state.get('keepalive'),
         )
         new_task = True
 
@@ -628,6 +731,7 @@ def clone_task(state, project_id=None):
         runtime_properties['_ssh_password'] = str(state['password'])
         runtime_properties['_user_key'] = str(config_obj.get("api.credentials.access_key"))
         runtime_properties['_user_secret'] = (config_obj.get("api.credentials.secret_key"))
+        runtime_properties['internal_tcp_port_request'] = str(internal_tcp_port_request)
         # noinspection PyProtectedMember
         task._set_runtime_properties(runtime_properties)
 
@@ -659,17 +763,37 @@ def clone_task(state, project_id=None):
     task_params["{}/vscode_extensions".format(section)] = state.get('vscode_extensions') or ''
     task_params["{}/force_dropbear".format(section)] = bool(state.get('force_dropbear'))
     task_params["{}/store_workspace".format(section)] = state.get('store_workspace')
+    task_params["{}/use_ssh_proxy".format(section)] = state.get('keepalive')
+    task_params["{}/router_enabled".format(section)] = bool(state.get('router_enabled'))
     if state.get('user_folder'):
         task_params['{}/user_base_directory'.format(section)] = state.get('user_folder')
     docker = state.get('docker') or task.get_base_docker()
     if not state.get('skip_docker_network') and not docker:
         docker = default_docker_image
     if docker:
-        task_params['{}/default_docker'.format(section)] = docker.replace('--network host', '').strip()
+        # just in case, clean up docker image name form args
+        docker = docker.replace('--network host', '').strip()
+        min_port = task_params["{}/ssh_ports".format(section)].split(":")[0] or "10022"
+        if min_port:
+            docker = docker.replace('-p 10022:{}'.format(min_port), '').strip()
+        task_params['{}/default_docker'.format(section)] = docker
+
+        # add user docker args
         if state.get('docker_args'):
             docker += ' {}'.format(state.get('docker_args'))
-        task.set_base_docker(docker + (
-            ' --network host' if not state.get('skip_docker_network') and '--network host' not in docker else ''))
+
+        if not state.get('skip_docker_network'):
+            # add network flags after user docker args
+            if state.get('docker_network') == "port":
+                if '-p 10022:{}'.format(min_port) not in docker:
+                    docker += ' -p 10022:{}'.format(min_port)
+            else:
+                if '--network host' not in docker:
+                    docker += ' --network host'
+
+        # set docker image/args
+        task.set_base_docker(docker)
+
     # set the bash init script
     if state.get('init_script') is not None and (not new_task or state.get('init_script').strip()):
         # noinspection PyProtectedMember
@@ -728,7 +852,7 @@ def clone_task(state, project_id=None):
     return task
 
 
-def wait_for_machine(state, task):
+def wait_for_machine(state, task, only_wait_for_ssh=False):
     # wait until task is running
     print('Waiting for remote machine allocation [id={}]'.format(task.id))
     last_status = None
@@ -768,9 +892,9 @@ def wait_for_machine(state, task):
     state['vscode_server'] = vscode_server.strip().lower() != 'false'
 
     wait_properties = ['properties/internal_ssh_port']
-    if state.get('jupyter_lab'):
+    if state.get('jupyter_lab') and not only_wait_for_ssh:
         wait_properties += ['properties/jupyter_port']
-    if state.get('vscode_server'):
+    if state.get('vscode_server') and not only_wait_for_ssh:
         wait_properties += ['properties/vscode_port']
 
     last_lines = []
@@ -819,32 +943,68 @@ def wait_for_machine(state, task):
     return task
 
 
-def start_ssh_tunnel(username, remote_address, ssh_port, ssh_password, local_remote_pair_list, debug=False):
+def start_ssh_tunnel(username, remote_address, ssh_port, ssh_password, local_remote_pair_list,
+                     debug=False, task=None, ignore_fingerprint_verification=False):
     print('Starting SSH tunnel to {}@{}, port {}'.format(username, remote_address, ssh_port))
     child = None
     args = ['-C',
             '{}@{}'.format(username, remote_address), '-p', '{}'.format(ssh_port),
-            '-o', 'UserKnownHostsFile=/dev/null',
             '-o', 'Compression=yes',
-            '-o', 'StrictHostKeyChecking=no',
             '-o', 'ServerAliveInterval=10',
             '-o', 'ServerAliveCountMax=10', ]
+
+    found_server_ssh_fingerprint = None
+    if task:
+        if Session.check_min_api_version('2.20'):
+            # noinspection PyBroadException
+            try:
+                res = task.session.send_request(
+                    "users", "get_vaults",
+                    params="enabled=true&types=remote_session_ssh_server&"
+                           "types=remote_session_ssh_server").json()
+                found_server_ssh_fingerprint = json.loads(res['data']['vaults'][-1]['data'])
+            except Exception:
+                pass
+
+    known_host_lines = ""
+    if found_server_ssh_fingerprint:
+        # create the known host file
+        for k in found_server_ssh_fingerprint:
+            if k.endswith("__pub"):
+                known_host_lines += "{} {}\n".format(remote_address, found_server_ssh_fingerprint[k])
+
+    temp_host_file = None
+    if known_host_lines:
+        print("SECURING CONNECTION: using secure remote host fingerprinting")
+        temp_host_file = NamedTemporaryFile(
+            prefix="remote_ssh_host_", suffix=".pub", mode="wt", delete=True)
+        temp_host_file.write(known_host_lines)
+        temp_host_file.flush()
+        args += ['-o', 'UserKnownHostsFile={}'.format(temp_host_file.name)]
+    else:
+        args += [
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'StrictHostKeyChecking=no',
+        ]
 
     for local, remote in local_remote_pair_list:
         args.extend(['-L', '{}:localhost:{}'.format(local, remote)])
 
     # store SSH output
-    fd = StringIO() if debug else sys.stdout
+    fd = sys.stdout if debug else StringIO()
 
+    command = None
+    child = None
     # noinspection PyBroadException
     try:
+        command = _check_ssh_executable()
         child = pexpect.spawn(
-            command=_check_ssh_executable(),
+            command=command,
             args=args,
             logfile=fd, timeout=20, encoding='utf-8')
 
         # Match only "(yes/no" in order to handle both (yes/no) and (yes/no/[fingerprint])
-        i = child.expect([r'(?i)password:', r'\(yes\/no', r'.*[$#] ', pexpect.EOF])
+        i = child.expect([r'(?i)password:', r'\(yes\/no', r'.*[$#] ', r'Permission denied \(publickey,password\)', pexpect.EOF])
         if i == 0:
             child.sendline(ssh_password)
             try:
@@ -859,6 +1019,14 @@ def start_ssh_tunnel(username, remote_address, ssh_port, ssh_password, local_rem
                 pass
 
         elif i == 1:
+            if known_host_lines:
+                print("{}! Secure fingerprint of remote server failed to verify!".format(
+                    "WARNING" if ignore_fingerprint_verification else "ERROR"))
+                if not ignore_fingerprint_verification:
+                    # we should have never gotten here!
+                    child.terminate(force=True)
+                    exit(1)
+
             child.sendline("yes")
             ret1 = child.expect([r"(?i)password:", pexpect.EOF])
             if ret1 == 0:
@@ -873,16 +1041,33 @@ def start_ssh_tunnel(username, remote_address, ssh_port, ssh_password, local_rem
                     raise ValueError('Incorrect password')
                 except pexpect.TIMEOUT:
                     pass
-    except Exception:
-        child.terminate(force=True)
+        elif i == 3:
+            raise Exception("SSH tunneling failed: please enable password authentication in your SSH client config.")
+    except Exception as ex:
+        if debug:
+            print("ERROR: running local SSH client [{}] failed connecting to {}: {}".format(command, args, ex))
+        else:
+            print("ERROR: running local SSH client failed connecting to {} [{}]\n"
+                  "       for additional details re-run with --verbose".format(remote_address, type(ex)))
+
+        if child:
+            child.terminate(force=True)
         child = None
+
+    if child:
+        # noinspection PyBroadException
+        try:
+            child.flush()
+        except BaseException as ex:
+            pass  # print("Failed to flush: {}".format(ex))
+
     print('\n')
     if child:
         child.logfile = None
-    return child, ssh_password
+    return child, ssh_password, temp_host_file
 
 
-def monitor_ssh_tunnel(state, task):
+def monitor_ssh_tunnel(state, task, ssh_setup_completed_callback=None):
     def interactive_ssh(p):
         import struct, fcntl, termios, signal, sys  # noqa
 
@@ -940,25 +1125,35 @@ def monitor_ssh_tunnel(state, task):
                 remote_address
             ]):
                 task.reload()
+                internal_ssh_port = None
+                remote_address = None
+                ssh_port = None
                 task_parameters = task.get_parameters()
                 if Session.check_min_api_version("2.13"):
                     # noinspection PyProtectedMember
                     runtime_prop = task._get_runtime_properties()
                     ssh_password = runtime_prop.get('_ssh_password') or state.get('password', '')
                     jupyter_token = runtime_prop.get('_jupyter_token')
+                    internal_ssh_port = runtime_prop.get('internal_tcp_port')
+                    remote_address = runtime_prop.get('external_address')
+                    ssh_port = runtime_prop.get('external_tcp_port')
                 else:
                     section = 'General' if 'General/ssh_server' in task_parameters else default_section
                     ssh_password = task_parameters.get('{}/ssh_password'.format(section)) or state.get('password', '')
                     jupyter_token = task_parameters.get('properties/jupyter_token')
 
-                remote_address = \
+                remote_address = remote_address or \
                     task_parameters.get('properties/k8s-gateway-address') or \
                     task_parameters.get('properties/external_address')
-                internal_ssh_port = task_parameters.get('properties/internal_ssh_port')
+
+                internal_ssh_port = internal_ssh_port or task_parameters.get('properties/internal_ssh_port')
+
                 jupyter_port = task_parameters.get('properties/jupyter_port')
-                ssh_port = \
-                    task_parameters.get('properties/k8s-pod-port') or \
-                    task_parameters.get('properties/external_ssh_port') or internal_ssh_port
+
+                ssh_port = ssh_port or \
+                   task_parameters.get('properties/k8s-pod-port') or \
+                   task_parameters.get('properties/external_ssh_port') or internal_ssh_port
+
                 if state.get('keepalive'):
                     internal_ssh_port = task_parameters.get('properties/internal_stable_ssh_port') or internal_ssh_port
                 local_remote_pair_list = [(local_ssh_port_, internal_ssh_port)]
@@ -997,11 +1192,13 @@ def monitor_ssh_tunnel(state, task):
                 "Enter \"r\" (\"reconnect\"), `s` (\"shell\"), `Ctrl-C` (\"quit\") or \"Shutdown\""
 
             if not ssh_process or not ssh_process.isalive():
-                ssh_process, ssh_password = start_ssh_tunnel(
+                ssh_process, ssh_password, known_host_file = start_ssh_tunnel(
                     state.get('username') or 'root',
                     remote_address, ssh_port, ssh_password,
                     local_remote_pair_list=local_remote_pair_list,
                     debug=state.get('verbose', False),
+                    task=task,
+                    ignore_fingerprint_verification=state.get('disable_fingerprint_check', False),
                 )
 
                 if ssh_process and ssh_process.isalive():
@@ -1024,11 +1221,23 @@ def monitor_ssh_tunnel(state, task):
                     if workspace_header_msg:
                         msg += "\n\n{}".format(workspace_header_msg)
 
+                    # we are here, we just connected, if this is the first time run the callback
+                    if ssh_setup_completed_callback and callable(ssh_setup_completed_callback):
+                        print("SSH setup completed calling callback")
+                        try:
+                            ssh_setup_completed_callback()
+                        except Exception as ex:
+                            print("Error executing callback function: {}".format(ex))
+                        # so we only do it once
+                        ssh_setup_completed_callback = None
+
                     print(msg)
                     print(connect_message)
                 else:
                     logging.getLogger().warning('SSH tunneling failed, retrying in {} seconds'.format(3))
                     sleep(3.)
+                    # clear ssh port, so that we reload it from Task (i.e. sync with router if it's there)
+                    ssh_port = None
                     continue
 
             connect_state['reconnect'] = False
@@ -1064,7 +1273,7 @@ def monitor_ssh_tunnel(state, task):
                 continue
             elif user_input.lower() == 'shutdown':
                 print('Shutting down interactive session')
-                task.mark_stopped()
+                request_task_abort(task)
                 shutdown = True
                 break
             elif user_input.lower() in ('r', 'reconnect', ):
@@ -1199,7 +1408,7 @@ class CliCommands:
             print("Warning: skipping session shutdown")
             return 0
 
-        task.mark_stopped()
+        request_task_abort(task)
         print("Session #{} shutdown".format(task.id))
         return 0
 
@@ -1212,22 +1421,26 @@ def setup_parser(parser):
     parser.add_argument("--shutdown", "-S", default=None, const="", nargs="?",
                         help="Shut down an active session (default: previous session)")
     parser.add_argument("--shell", action='store_true', default=None,
-                        help="Open the SSH shell session directly, notice quitting the SSH session "
-                             "will Not shut down the remote session")
+                        help="Open the SSH shell session directly, notice quiting the SSH session "
+                             "will Not shutdown the remote session")
     parser.add_argument('--debugging-session', type=str, default=None,
                         help='Pass existing Task id (experiment), create a copy of the experiment on a remote machine, '
                              'and launch jupyter/ssh for interactive access. Example --debugging-session <task_id>')
     parser.add_argument('--queue', type=str, default=None,
                         help='Select the queue to launch the interactive session on (default: previously used queue)')
+    parser.add_argument("--router-enabled", default=None, nargs='?', const='true', metavar='true/false',
+                        type=lambda x: (str(x).strip().lower() in ('true', 'yes')),
+                        help="If we have a clearml Router set, make sure we request direct TCP routing "
+                             "to our container. ")
     parser.add_argument('--docker', type=str, default=None,
-                        help='Select the docker image to use in the interactive session '
+                        help='Select the docker image to use in the interactive session on '
                              '(default: previously used docker image or `{}`)'.format(default_docker_image))
     parser.add_argument('--docker-args', type=str, default=None,
                         help='Add additional arguments for the docker image to use in the interactive session on '
                              '(default: previously used docker-args)')
     parser.add_argument('--public-ip', default=None, nargs='?', const='true', metavar='true/false',
                         type=lambda x: (str(x).strip().lower() in ('true', 'yes')),
-                        help='If True, register the public IP of the remote machine. Set if running on the cloud. '
+                        help='If True register the public IP of the remote machine. Set if running on the cloud. '
                              'Default: false (use for local / on-premises)')
     parser.add_argument('--remote-ssh-port', type=str, default=None,
                         help='Set the remote ssh server port, running on the agent`s machine. (default: 10022)')
@@ -1254,7 +1467,7 @@ def setup_parser(parser):
     parser.add_argument('--store-workspace', type=str, default=None,
                         help='Upload/Restore remote workspace folder. '
                              'Example: `~/workspace/` will automatically restore/store the *containers* folder '
-                             'and extract it into the next session. '
+                             'and extract it into next the session. '
                              'Use with --continue-session to continue your '
                              'previous work from your exact container state')
     parser.add_argument('--git-credentials', default=False, nargs='?', const='true', metavar='true/false',
@@ -1296,24 +1509,40 @@ def setup_parser(parser):
     parser.add_argument('--keepalive', default=False, nargs='?', const='true', metavar='true/false',
                         type=lambda x: (str(x).strip().lower() in ('true', 'yes')),
                         help='Advanced: If set, enables the transparent proxy always keeping the sockets alive. '
-                             'Default: False, do not use transparent sockets for mitigating connection drops.')
+                             'Default: False, do not use transparent socket for mitigating connection drops.')
     parser.add_argument('--queue-excluded-tag', default=None, nargs='*',
                         help='Advanced: Excluded queues with this specific tag from the selection')
     parser.add_argument('--queue-include-tag', default=None, nargs='*',
                         help='Advanced: Only include queues with this specific tag from the selection')
     parser.add_argument('--skip-docker-network', default=None, nargs='?', const='true', metavar='true/false',
                         type=lambda x: (str(x).strip().lower() in ('true', 'yes')),
-                        help='Advanced: If set, `--network host` is **not** passed to docker '
+                        help='Advanced: If set, `--network host` or `-p <host_port>:<container_port>` are **not** passed to docker '
                              '(assumes k8s network ingestion) (default: false)')
+    parser.add_argument('--docker-network', default='host', choices=['host', 'port'], metavar='host/port',
+                        help='Advanced: If set, `host` (default) then `--network host` is passed to docker '
+                             'If set, `port` then `-p 10022:10022` is passed to docker. '
+                             'Notice: `port` requires clearml-agent v2+')
     parser.add_argument('--password', type=str, default=None,
                         help='Advanced: Select ssh password for the interactive session '
                              '(default: `randomly-generated` or previously used one)')
+    parser.add_argument('--randomize', type=str, nargs='*', default=False,
+                        help='Advanced: Recreate a new random ssh password for the interactive session '
+                             'options: `--randomize` one time recreate random password, '
+                             '--randomize `always` create a new random password for every session')
     parser.add_argument('--username', type=str, default=None,
                         help='Advanced: Select ssh username for the interactive session '
                              '(default: `root` or previously used one)')
     parser.add_argument('--force-dropbear', default=None, nargs='?', const='true', metavar='true/false',
                         type=lambda x: (str(x).strip().lower() in ('true', 'yes')),
                         help='Force using `dropbear` instead of SSHd')
+    parser.add_argument('--disable-storage-packages', default=None, nargs='?', const='true', metavar='true/false',
+                        type=lambda x: (str(x).strip().lower() in ('true', 'yes')),
+                        help='If True automatic boto3/azure-storage-blob/google-cloud-storage python '
+                             'packages will not be added, you can manually add them using --packages')
+    parser.add_argument('--disable-store-defaults', action='store_true', default=None,
+                        help='If set, do not store current setup as new default configuration')
+    parser.add_argument('--disable-fingerprint-check', action='store_true', default=None,
+                        help='Advanced: If set, ignore the remote SSH server fingerprint check')
     parser.add_argument('--verbose', action='store_true', default=None,
                         help='Advanced: If set, print verbose progress information, '
                              'e.g. the remote machine setup process log')
@@ -1365,12 +1594,7 @@ def cli():
 
     # load previous state
     state_file = os.path.abspath(os.path.expandvars(os.path.expanduser(args.config_file)))
-    state = load_state(state_file)
-
-    if args.verbose:
-        state['verbose'] = args.verbose
-
-    state['shell'] = bool(args.shell)
+    state = load_state(state_file, args=args)
 
     if args.command:
         if args.command in ("info", "shutdown") and not args.id:
@@ -1400,7 +1624,7 @@ def cli():
         if not task:
             print("No session to shut down, exiting")
             return 1
-        task.mark_stopped()
+        request_task_abort(task)
         print("Session #{} shut down, goodbye!".format(task.id))
         return 0
 
@@ -1413,6 +1637,9 @@ def cli():
     # get previous session, if it is running
     task = _get_previous_session(client, args, state, task_id=args.attach)
 
+    delete_old_tasks_callback = None
+    only_wait_for_ssh = False
+
     if task:
         state['task_id'] = task.id
         save_state(state, state_file)
@@ -1420,6 +1647,7 @@ def cli():
             state['username'] = args.username
         if args.password:
             state['password'] = args.password
+        only_wait_for_ssh = True
     else:
         state.pop('task_id', None)
         save_state(state, state_file)
@@ -1439,8 +1667,12 @@ def cli():
         # ask user final approval
         ask_launch(args)
 
-        # remove old Tasks created by us.
-        delete_old_tasks(state, client, state.get('base_task_id'))
+        # remove old Tasks created by us, unless we have to restore workspace,
+        if state.get("store_workspace") or state.get("continue_session"):
+            # then we do it Only after a successful remote session
+            delete_old_tasks_callback = partial(delete_old_tasks, state, client, state.get('base_task_id'))
+        else:
+            delete_old_tasks(state, client, state.get('base_task_id'))
 
         # Clone the Task and adjust parameters
         task = clone_task(state)
@@ -1452,13 +1684,13 @@ def cli():
 
     # wait for machine to become available
     try:
-        wait_for_machine(state, task)
+        wait_for_machine(state, task, only_wait_for_ssh=only_wait_for_ssh)
     except ValueError as ex:
         print('\nERROR: {}'.format(ex))
         return 1
 
     # launch ssh tunnel
-    monitor_ssh_tunnel(state, task)
+    monitor_ssh_tunnel(state, task, ssh_setup_completed_callback=delete_old_tasks_callback)
 
     # we are done
     print('Goodbye')
@@ -1507,6 +1739,7 @@ def _get_previous_session(
             choice = input("{} active session id={} [Y]/n? ".format(question_verb, task_id))
             if str(choice).strip().lower() in ("", "y", "yes"):
                 return Task.get_task(task_id=task_id)
+            return None
 
     # multiple sessions running
     print("{} active session:".format(verb))

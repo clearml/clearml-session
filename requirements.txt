@@ -1,3 +1,5 @@
 clearml >= 1.9
+pillow >= 10.3.0  # due to vulnerability from clearml 1.18.0
+psutil
 pexpect ; sys_platform != 'win32'
 wexpect_venv ; sys_platform == 'win32'
