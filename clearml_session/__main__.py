@@ -500,6 +500,19 @@ def _get_user_id(client):
     return current_user_id
 
 
+def _get_user_name(client):
+    if not client:
+        client = APIClient()
+    # noinspection PyBroadException
+    try:
+        res = client.session.send_request(service='users', action='get_current_user', async_enable=False)
+        if res.ok:
+            return res.json()['data']['user'].get('name')
+    except Exception:
+        pass
+    return None
+
+
 def _b64_encode_file(file):
     # noinspection PyBroadException
     try:
@@ -562,6 +575,12 @@ def get_user_inputs(args, parser, state, client):
                 "\nCould not locate previously used value of '{}', please provide it?"
                 "\n    Help: {}\n> ".format(
                     a, parser._option_string_actions['--{}'.format(a.replace('_', '-'))].help))
+
+    # if no session name was set, default to 'Interactive Session - <username>'
+    if not state.get('session_name'):
+        user_name = _get_user_name(client)
+        if user_name:
+            state['session_name'] = 'Interactive Session - {}'.format(user_name)
 
     # if no password was set, create a new random one
     if not state.get('password') or state.get("randomize") is not False:
