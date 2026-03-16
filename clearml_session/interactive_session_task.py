@@ -1626,7 +1626,7 @@ class SyncCallback:
 
                 with open(full_path, "wt") as f:
                     f.write(source_function)
-                os.chmod(full_path, 0o777)
+                os.chmod(full_path, 0o755)
 
                 if p.as_posix() not in path_folders:
                     os.environ["PATH"] = (
