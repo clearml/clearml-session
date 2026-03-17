@@ -107,6 +107,19 @@ def _get_env_vars(*var_names, default=None):
     return default
 
 
+def _is_root_user():
+    """Check if running as root/administrator in a cross-platform way."""
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        else:
+            # Unix/Linux/macOS
+            return os.geteuid() == 0
+    except:
+        return False
+
+
 def init_task(param, a_default_ssh_fingerprint):
     # initialize ClearML
     Task.add_requirements('jupyter')
@@ -707,7 +720,7 @@ def setup_ssh_server(hostname, hostnames, param, task, env):
         use_dropbear = bool(param.get("force_dropbear", False))
 
         # if we are root, install open-ssh
-        if not use_dropbear and os.geteuid() == 0:
+        if not use_dropbear and _is_root_user():
             # noinspection SpellCheckingInspection
             os.system(
                 "export PYTHONPATH=\"\" && "
@@ -977,7 +990,7 @@ def setup_user_env(param, task):
             print('Applying vault configuration failed: {}'.format(ex))
 
     # do not change user bash/profile if we are not running inside a container
-    if os.geteuid() != 0:
+    if not _is_root_user():
         # check if we are inside a container
         is_container = False
         try:
@@ -1703,7 +1716,7 @@ class SyncCallback:
             return
 
         # if we are not running as root, remove the root check
-        if os.getuid() != 0:
+        if not _is_root_user():
             batch_command = [batch_command[0]] + batch_command[2:]
 
         path_folders = os.environ.get("PATH", "/usr/bin").split(os.pathsep)
